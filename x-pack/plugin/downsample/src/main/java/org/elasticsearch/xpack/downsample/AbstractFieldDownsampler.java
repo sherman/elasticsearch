@@ -7,6 +7,8 @@
 
 package org.elasticsearch.xpack.downsample;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.internal.hppc.IntArrayList;
 import org.elasticsearch.action.downsample.DownsampleConfig;
@@ -29,6 +31,7 @@ import static org.elasticsearch.index.mapper.TimeSeriesParams.MetricType.POSITIO
  */
 abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer {
 
+    private static final Logger logger = LogManager.getLogger(AbstractFieldDownsampler.class);
     private final String name;
     protected State state;
     protected final IndexFieldData<?> fieldData;
@@ -110,8 +113,18 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
                     final IndexFieldData<?> fieldData;
                     if (fieldType instanceof FlattenedFieldMapper.RootFlattenedFieldType flattenedFieldType) {
                         var keyedFieldType = flattenedFieldType.getKeyedFieldType();
+                        // will not pass the document validation
+                        if (keyedFieldType.name().contains("..")) {
+                            logger.error("Skip field with invalid name: " + keyedFieldType.name());
+                            continue;
+                        }
                         fieldData = context.getForField(keyedFieldType, MappedFieldType.FielddataOperation.SEARCH);
                     } else {
+                        // will not pass the document validation
+                        if (fieldType.name().contains("..")) {
+                            logger.error("Skip field with invalid name: " + fieldType.name());
+                            continue;
+                        }
                         fieldData = context.getForField(fieldType, MappedFieldType.FielddataOperation.SEARCH);
                     }
                     downsamplers.add(create(field, fieldType, fieldData, samplingMethod, fieldCounts));
