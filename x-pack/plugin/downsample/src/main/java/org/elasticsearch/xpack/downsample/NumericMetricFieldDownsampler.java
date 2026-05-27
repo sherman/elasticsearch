@@ -188,7 +188,8 @@ abstract sealed class NumericMetricFieldDownsampler extends AbstractFieldDownsam
         MappedFieldType fieldType,
         IndexFieldData<?> fieldData,
         DownsampleConfig.SamplingMethod samplingMethod,
-        DownsamplerCountPerValueType fieldCounts
+        DownsamplerCountPerValueType fieldCounts,
+        AggregateGaugeCollectionMode aggregateGaugeCollectionMode
     ) {
         assert supportsFieldType(fieldType)
             : "only gauges and counters accepted, other metrics should have been handled by dedicated downsamplers";
@@ -199,7 +200,7 @@ abstract sealed class NumericMetricFieldDownsampler extends AbstractFieldDownsam
         }
         if (metricType == TimeSeriesParams.MetricType.GAUGE) {
             fieldCounts.increaseNumericFields();
-            return new NumericMetricFieldDownsampler.AggregateGauge(fieldName, fieldData);
+            return new NumericMetricFieldDownsampler.AggregateGauge(fieldName, fieldData, aggregateGaugeCollectionMode);
         }
         fieldCounts.increaseAggregateCounterFields();
         return new NumericMetricFieldDownsampler.AggregateCounter(fieldName, fieldData);
@@ -218,8 +219,33 @@ abstract sealed class NumericMetricFieldDownsampler extends AbstractFieldDownsam
         final CompensatedSum sum = new CompensatedSum();
         long count;
 
+        private final AggregateGaugeCollectionMode collectionMode;
+
         AggregateGauge(String name, IndexFieldData<?> fieldData) {
+            this(name, fieldData, AggregateGaugeCollectionMode.OPTIMIZED);
+        }
+
+        AggregateGauge(String name, IndexFieldData<?> fieldData, AggregateGaugeCollectionMode collectionMode) {
             super(name, fieldData);
+            this.collectionMode = collectionMode;
+        }
+
+        @Override
+        public void collect(SortedNumericDoubleValues docValues, IntArrayList docIdBuffer) throws IOException {
+            if (collectionMode == AggregateGaugeCollectionMode.LEGACY) {
+                collectLegacy(docValues, docIdBuffer);
+                return;
+            }
+            super.collect(docValues, docIdBuffer);
+        }
+
+        private void collectLegacy(SortedNumericDoubleValues docValues, IntArrayList docIdBuffer) throws IOException {
+            for (int i = 0; i < docIdBuffer.size(); i++) {
+                int docId = docIdBuffer.get(i);
+                if (docValues.advanceExact(docId)) {
+                    collectCurrentValues(docValues);
+                }
+            }
         }
 
         @Override

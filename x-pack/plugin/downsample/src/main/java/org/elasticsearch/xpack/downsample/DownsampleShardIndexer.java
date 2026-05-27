@@ -127,6 +127,38 @@ class DownsampleShardIndexer {
         final Map<String, String> multiFieldSources,
         final DownsampleShardPersistentTaskState state
     ) {
+        this(
+            task,
+            client,
+            indexService,
+            downsampleMetrics,
+            shardId,
+            downsampleIndex,
+            config,
+            metrics,
+            labels,
+            dimensions,
+            multiFieldSources,
+            state,
+            AggregateGaugeCollectionMode.OPTIMIZED
+        );
+    }
+
+    DownsampleShardIndexer(
+        final DownsampleShardTask task,
+        final Client client,
+        final IndexService indexService,
+        final DownsampleMetrics downsampleMetrics,
+        final ShardId shardId,
+        final String downsampleIndex,
+        final DownsampleConfig config,
+        final String[] metrics,
+        final String[] labels,
+        final String[] dimensions,
+        final Map<String, String> multiFieldSources,
+        final DownsampleShardPersistentTaskState state,
+        final AggregateGaugeCollectionMode aggregateGaugeCollectionMode
+    ) {
         this.task = task;
         this.client = client;
         this.downsampleMetrics = downsampleMetrics;
@@ -158,7 +190,14 @@ class DownsampleShardIndexer {
 
             List<AbstractFieldDownsampler<?>> downsamplers = new ArrayList<>(metrics.length + labels.length + dimensions.length);
             downsamplers.addAll(
-                AbstractFieldDownsampler.create(searchExecutionContext, metrics, multiFieldSources, samplingMethod, fieldCounts)
+                AbstractFieldDownsampler.create(
+                    searchExecutionContext,
+                    metrics,
+                    multiFieldSources,
+                    samplingMethod,
+                    fieldCounts,
+                    aggregateGaugeCollectionMode
+                )
             );
             // Labels are downsampled using the last value, they are not influenced by the requested sampling method
             downsamplers.addAll(
@@ -167,7 +206,8 @@ class DownsampleShardIndexer {
                     labels,
                     multiFieldSources,
                     DownsampleConfig.SamplingMethod.LAST_VALUE,
-                    fieldCounts
+                    fieldCounts,
+                    aggregateGaugeCollectionMode
                 )
             );
             downsamplers.addAll(DimensionFieldDownsampler.create(searchExecutionContext, dimensions, multiFieldSources, fieldCounts));

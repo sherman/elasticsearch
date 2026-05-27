@@ -107,6 +107,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
@@ -117,6 +118,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static java.util.Collections.emptyMap;
@@ -325,6 +327,36 @@ public class DownsampleActionSingleNodeTests extends ESSingleNodeTestCase {
         prepareSourceIndex(sourceIndex, true);
         downsample(sourceIndex, downsampleIndex, config);
         assertDownsampleIndex(sourceIndex, downsampleIndex, config);
+    }
+
+    public void testDownsampleAggregateGaugeCollectionModesProduceSameDocuments() throws Exception {
+        DownsampleConfig config = new DownsampleConfig(DateHistogramInterval.HOUR, DownsampleConfig.SamplingMethod.AGGREGATE);
+        AtomicInteger nextDoc = new AtomicInteger();
+        SourceSupplier sourceSupplier = () -> {
+            int doc = nextDoc.getAndIncrement();
+            return XContentFactory.jsonBuilder()
+                .startObject()
+                .field(FIELD_TIMESTAMP, DATE_FORMATTER.formatMillis(startTime + doc * 1000L))
+                .field(FIELD_DIMENSION_1, "dimension-" + doc % 3)
+                .field(FIELD_NUMERIC_1, doc % 17 + 0.25d)
+                .endObject();
+        };
+        bulkIndex(sourceSupplier);
+        prepareSourceIndex(sourceIndex, true);
+
+        String legacyDownsampleIndex = "downsample-legacy-" + sourceIndex;
+        String optimizedDownsampleIndex = "downsample-optimized-" + sourceIndex;
+        try {
+            updateClusterSettings(Settings.builder().put(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING.getKey(), "legacy").build());
+            downsample(sourceIndex, legacyDownsampleIndex, config);
+
+            updateClusterSettings(Settings.builder().put(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING.getKey(), "optimized").build());
+            downsample(sourceIndex, optimizedDownsampleIndex, config);
+
+            assertThat(fetchSourceDocuments(optimizedDownsampleIndex), equalTo(fetchSourceDocuments(legacyDownsampleIndex)));
+        } finally {
+            updateClusterSettings(Settings.builder().putNull(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING.getKey()).build());
+        }
     }
 
     public void testDownsampleIndexWithFlattenedAndMultiFieldDimensions() throws Exception {
@@ -1194,6 +1226,19 @@ public class DownsampleActionSingleNodeTests extends ESSingleNodeTestCase {
             return resp.getAggregations();
         } finally {
             resp.decRef();
+        }
+    }
+
+    private List<Map<String, Object>> fetchSourceDocuments(String index) {
+        SearchResponse response = client().prepareSearch(index)
+            .setSize(10_000)
+            .addSort(TimeSeriesIdFieldMapper.NAME, SortOrder.ASC)
+            .addSort(FIELD_TIMESTAMP, SortOrder.ASC)
+            .get();
+        try {
+            return Arrays.stream(response.getHits().getHits()).map(SearchHit::getSourceAsMap).toList();
+        } finally {
+            response.decRef();
         }
     }
 

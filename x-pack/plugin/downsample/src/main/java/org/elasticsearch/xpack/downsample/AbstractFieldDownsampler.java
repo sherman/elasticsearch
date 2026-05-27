@@ -98,7 +98,8 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
         String[] fields,
         Map<String, String> multiFieldSources,
         DownsampleConfig.SamplingMethod samplingMethod,
-        DownsamplerCountPerValueType fieldCounts
+        DownsamplerCountPerValueType fieldCounts,
+        AggregateGaugeCollectionMode aggregateGaugeCollectionMode
     ) {
         List<AbstractFieldDownsampler<?>> downsamplers = new ArrayList<>();
         for (String field : fields) {
@@ -127,7 +128,7 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
                         }
                         fieldData = context.getForField(fieldType, MappedFieldType.FielddataOperation.SEARCH);
                     }
-                    downsamplers.add(create(field, fieldType, fieldData, samplingMethod, fieldCounts));
+                    downsamplers.add(create(field, fieldType, fieldData, samplingMethod, fieldCounts, aggregateGaugeCollectionMode));
                 }
             }
         }
@@ -142,7 +143,8 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
         MappedFieldType fieldType,
         IndexFieldData<?> fieldData,
         DownsampleConfig.SamplingMethod samplingMethod,
-        DownsamplerCountPerValueType fieldCounts
+        DownsamplerCountPerValueType fieldCounts,
+        AggregateGaugeCollectionMode aggregateGaugeCollectionMode
     ) {
         assert AggregateMetricDoubleFieldDownsampler.supportsFieldType(fieldType) == false
             : "Aggregate metric double should be handled by a dedicated downsampler";
@@ -159,7 +161,14 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
             return ExponentialHistogramFieldDownsampler.create(fieldName, fieldData, samplingMethod);
         }
         if (NumericMetricFieldDownsampler.supportsFieldType(fieldType)) {
-            return NumericMetricFieldDownsampler.create(fieldName, fieldType, fieldData, samplingMethod, fieldCounts);
+            return NumericMetricFieldDownsampler.create(
+                fieldName,
+                fieldType,
+                fieldData,
+                samplingMethod,
+                fieldCounts,
+                aggregateGaugeCollectionMode
+            );
         }
         // TODO: Support POSITION in downsampling
         if (fieldType.getMetricType() == POSITION) {

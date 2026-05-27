@@ -235,6 +235,46 @@ public class NumericMetricFieldDownsamplerTests extends AggregatorTestCase {
         assertEquals(field, producer.name());
     }
 
+    public void testGaugeMetricCollectionModesProduceSameResult() throws IOException {
+        var docIdBuffer = IntArrayList.from(0, 1, 2, 3, 4, 5, 6);
+        var docIdsWithValues = IntArrayList.from(1, 3, 6);
+        var legacyProducer = new NumericMetricFieldDownsampler.AggregateGauge(
+            randomAlphaOfLength(10),
+            null,
+            AggregateGaugeCollectionMode.LEGACY
+        );
+        var optimizedProducer = new NumericMetricFieldDownsampler.AggregateGauge(
+            legacyProducer.name(),
+            null,
+            AggregateGaugeCollectionMode.OPTIMIZED
+        );
+
+        legacyProducer.collect(withDocIdIterator(docIdsWithValues, 12.2, 55.0, 3.5), docIdBuffer);
+        optimizedProducer.collect(withDocIdIterator(docIdsWithValues, 12.2, 55.0, 3.5), docIdBuffer);
+
+        assertFalse(legacyProducer.isEmpty());
+        assertFalse(optimizedProducer.isEmpty());
+        assertEquals(legacyProducer.min, optimizedProducer.min, 0d);
+        assertEquals(legacyProducer.max, optimizedProducer.max, 0d);
+        assertEquals(legacyProducer.sum.value(), optimizedProducer.sum.value(), 0d);
+        assertEquals(legacyProducer.count, optimizedProducer.count);
+    }
+
+    public void testGaugeMetricFallsBackWhenDocIdIteratorIsUnavailable() throws IOException {
+        final String field = "field";
+        NumericMetricFieldDownsampler producer = new NumericMetricFieldDownsampler.AggregateGauge(field, null);
+        var docIdBuffer = IntArrayList.from(0, 1, 2);
+        var valuesInstance = withoutDocIdIterator(docIdBuffer, 55.0, 12.2, 5.5);
+        producer.collect(valuesInstance, docIdBuffer);
+
+        assertFalse(producer.isEmpty());
+
+        XContentBuilder builder = JsonXContent.contentBuilder().startObject();
+        producer.write(builder);
+        builder.endObject();
+        assertEquals("{\"field\":{\"min\":5.5,\"max\":55.0,\"sum\":72.7,\"value_count\":3}}", Strings.toString(builder));
+    }
+
     public void testGaugeMetricSkipsSparseDocsWithDocIdIterator() throws IOException {
         NumericMetricFieldDownsampler.AggregateGauge producer = new NumericMetricFieldDownsampler.AggregateGauge(
             randomAlphaOfLength(10),

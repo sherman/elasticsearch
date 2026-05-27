@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.downsample;
 
+import org.apache.logging.log4j.Level;
 import org.elasticsearch.action.downsample.DownsampleConfig;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.ClusterState;
@@ -20,8 +21,11 @@ import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.routing.IndexRoutingTable;
 import org.elasticsearch.cluster.routing.RoutingTable;
 import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.shard.ShardId;
@@ -29,6 +33,7 @@ import org.elasticsearch.persistent.ClusterPersistentTasksCustomMetadata;
 import org.elasticsearch.persistent.PersistentTasksCustomMetadata;
 import org.elasticsearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.xpack.core.downsample.DownsampleShardIndexerStatus;
 import org.elasticsearch.xpack.core.downsample.DownsampleShardPersistentTaskState;
 import org.elasticsearch.xpack.core.downsample.DownsampleShardTask;
@@ -48,6 +53,7 @@ import static org.hamcrest.Matchers.anyOf;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class DownsampleShardPersistentTaskExecutorTests extends ESTestCase {
 
@@ -67,6 +73,37 @@ public class DownsampleShardPersistentTaskExecutorTests extends ESTestCase {
             List.of(new Tuple<>(start, end))
         );
         executor = new DownsampleShardPersistentTaskExecutor(mock(Client.class), DownsampleShardTask.TASK_NAME, mock(Executor.class));
+    }
+
+    public void testAggregateGaugeCollectionModeSettingUpdates() {
+        var settings = Settings.builder().put(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING.getKey(), "legacy").build();
+        ClusterSettings clusterSettings = new ClusterSettings(settings, Set.of(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING));
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
+
+        executor = new DownsampleShardPersistentTaskExecutor(
+            mock(Client.class),
+            DownsampleShardTask.TASK_NAME,
+            mock(Executor.class),
+            clusterService
+        );
+        assertThat(executor.aggregateGaugeCollectionMode(), equalTo(AggregateGaugeCollectionMode.LEGACY));
+
+        try (var mockLog = MockLog.capture(DownsampleShardPersistentTaskExecutor.class)) {
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
+                    "collection mode update",
+                    DownsampleShardPersistentTaskExecutor.class.getCanonicalName(),
+                    Level.INFO,
+                    "downsample aggregate gauge collection mode changed from [legacy] to [optimized]"
+                )
+            );
+            clusterSettings.applySettings(
+                Settings.builder().put(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING.getKey(), "optimized").build()
+            );
+            mockLog.assertAllExpectationsMatched();
+        }
+        assertThat(executor.aggregateGaugeCollectionMode(), equalTo(AggregateGaugeCollectionMode.OPTIMIZED));
     }
 
     public void testGetAssignment() {

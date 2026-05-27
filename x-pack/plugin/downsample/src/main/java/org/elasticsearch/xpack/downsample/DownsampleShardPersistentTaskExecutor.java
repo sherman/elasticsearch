@@ -26,6 +26,7 @@ import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
 import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
@@ -61,10 +62,39 @@ import java.util.stream.Collectors;
 public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecutor<DownsampleShardTaskParams> {
     private static final Logger LOGGER = LogManager.getLogger(DownsampleShardPersistentTaskExecutor.class);
     private final Client client;
+    private volatile AggregateGaugeCollectionMode aggregateGaugeCollectionMode;
 
     public DownsampleShardPersistentTaskExecutor(final Client client, final String taskName, final Executor executor) {
         super(taskName, executor);
         this.client = Objects.requireNonNull(client);
+        this.aggregateGaugeCollectionMode = AggregateGaugeCollectionMode.OPTIMIZED;
+    }
+
+    public DownsampleShardPersistentTaskExecutor(
+        final Client client,
+        final String taskName,
+        final Executor executor,
+        final ClusterService clusterService
+    ) {
+        this(client, taskName, executor);
+        clusterService.getClusterSettings()
+            .initializeAndWatch(Downsample.AGGREGATE_GAUGE_COLLECTION_MODE_SETTING, this::setAggregateGaugeCollectionMode);
+    }
+
+    private void setAggregateGaugeCollectionMode(AggregateGaugeCollectionMode aggregateGaugeCollectionMode) {
+        AggregateGaugeCollectionMode previousAggregateGaugeCollectionMode = this.aggregateGaugeCollectionMode;
+        this.aggregateGaugeCollectionMode = aggregateGaugeCollectionMode;
+        if (previousAggregateGaugeCollectionMode != aggregateGaugeCollectionMode) {
+            LOGGER.info(
+                "downsample aggregate gauge collection mode changed from [{}] to [{}]",
+                previousAggregateGaugeCollectionMode,
+                aggregateGaugeCollectionMode
+            );
+        }
+    }
+
+    AggregateGaugeCollectionMode aggregateGaugeCollectionMode() {
+        return aggregateGaugeCollectionMode;
     }
 
     @Override
@@ -78,13 +108,14 @@ public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecut
         final DownsampleShardTaskParams params,
         final PersistentTaskState state
     ) {
+        final var aggregateGaugeCollectionMode = this.aggregateGaugeCollectionMode;
         // NOTE: query the downsampling target index so that we can start the downsampling task from the latest indexed tsid.
         final SearchRequest searchRequest = new SearchRequest(params.downsampleIndex());
         searchRequest.source().sort(TimeSeriesIdFieldMapper.NAME, SortOrder.DESC).size(1);
         searchRequest.preference("_shards:" + params.shardId().id());
         client.search(searchRequest, ActionListener.wrap(searchResponse -> {
-            delegate(task, params, extractTsId(searchResponse.getHits().getHits()));
-        }, e -> delegate(task, params, null)));
+            delegate(task, params, extractTsId(searchResponse.getHits().getHits()), aggregateGaugeCollectionMode);
+        }, e -> delegate(task, params, null, aggregateGaugeCollectionMode)));
     }
 
     private static BytesRef extractTsId(SearchHit[] lastDownsampleTsidHits) {
@@ -189,11 +220,16 @@ public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecut
         return EsExecutors.DIRECT_EXECUTOR_SERVICE;
     }
 
-    private void delegate(final AllocatedPersistentTask task, final DownsampleShardTaskParams params, final BytesRef lastDownsampleTsid) {
+    private void delegate(
+        final AllocatedPersistentTask task,
+        final DownsampleShardTaskParams params,
+        final BytesRef lastDownsampleTsid,
+        final AggregateGaugeCollectionMode aggregateGaugeCollectionMode
+    ) {
         DownsampleShardTask downsampleShardTask = (DownsampleShardTask) task;
         client.execute(
             DelegatingAction.INSTANCE,
-            new DelegatingAction.Request(downsampleShardTask, lastDownsampleTsid, params),
+            new DelegatingAction.Request(downsampleShardTask, lastDownsampleTsid, params, aggregateGaugeCollectionMode),
             ActionListener.wrap(empty -> {}, e -> {
                 LOGGER.error("error while delegating", e);
                 markAsFailed(downsampleShardTask, e);
@@ -212,7 +248,8 @@ public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecut
         DownsampleMetrics downsampleMetrics,
         DownsampleShardTask task,
         DownsampleShardTaskParams params,
-        BytesRef lastDownsampledTsid
+        BytesRef lastDownsampledTsid,
+        AggregateGaugeCollectionMode aggregateGaugeCollectionMode
     ) {
         client.threadPool().executor(Downsample.DOWNSAMPLE_TASK_THREAD_POOL_NAME).execute(new AbstractRunnable() {
             @Override
@@ -239,7 +276,8 @@ public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecut
                         params.labels(),
                         params.dimensions(),
                         params.multiFieldSources() == null ? Map.of() : params.multiFieldSources(),
-                        initialState
+                        initialState,
+                        aggregateGaugeCollectionMode
                     );
                     downsampleShardIndexer.execute();
                     task.markAsCompleted();
@@ -290,11 +328,18 @@ public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecut
             private final DownsampleShardTask task;
             private final BytesRef lastDownsampleTsid;
             private final DownsampleShardTaskParams params;
+            private final AggregateGaugeCollectionMode aggregateGaugeCollectionMode;
 
-            public Request(DownsampleShardTask task, BytesRef lastDownsampleTsid, DownsampleShardTaskParams params) {
+            public Request(
+                DownsampleShardTask task,
+                BytesRef lastDownsampleTsid,
+                DownsampleShardTaskParams params,
+                AggregateGaugeCollectionMode aggregateGaugeCollectionMode
+            ) {
                 this.task = task;
                 this.lastDownsampleTsid = lastDownsampleTsid;
                 this.params = params;
+                this.aggregateGaugeCollectionMode = aggregateGaugeCollectionMode;
             }
 
             @Override
@@ -346,7 +391,15 @@ public class DownsampleShardPersistentTaskExecutor extends PersistentTasksExecut
 
             @Override
             protected void doExecute(Task t, Request request, ActionListener<ActionResponse.Empty> listener) {
-                realNodeOperation(client, indicesService, downsampleMetrics, request.task, request.params, request.lastDownsampleTsid);
+                realNodeOperation(
+                    client,
+                    indicesService,
+                    downsampleMetrics,
+                    request.task,
+                    request.params,
+                    request.lastDownsampleTsid,
+                    request.aggregateGaugeCollectionMode
+                );
                 listener.onResponse(ActionResponse.Empty.INSTANCE);
             }
 

@@ -13,6 +13,7 @@ import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
+import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.settings.SettingsModule;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
@@ -40,6 +41,13 @@ import java.util.function.Supplier;
 public class Downsample extends Plugin implements ActionPlugin, PersistentTaskPlugin {
 
     public static final String DOWNSAMPLE_TASK_THREAD_POOL_NAME = "downsample_indexing";
+    static final Setting<AggregateGaugeCollectionMode> AGGREGATE_GAUGE_COLLECTION_MODE_SETTING = Setting.enumSetting(
+        AggregateGaugeCollectionMode.class,
+        "xpack.downsample.aggregate_gauge.collection_mode",
+        AggregateGaugeCollectionMode.OPTIMIZED,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
     private static final int DOWNSAMPLE_TASK_THREAD_POOL_QUEUE_SIZE = 256;
 
     @Override
@@ -53,6 +61,11 @@ public class Downsample extends Plugin implements ActionPlugin, PersistentTaskPl
             EsExecutors.TaskTrackingConfig.DO_NOT_TRACK
         );
         return List.of(downsample);
+    }
+
+    @Override
+    public List<Setting<?>> getSettings() {
+        return List.of(AGGREGATE_GAUGE_COLLECTION_MODE_SETTING);
     }
 
     @Override
@@ -87,7 +100,8 @@ public class Downsample extends Plugin implements ActionPlugin, PersistentTaskPl
             new DownsampleShardPersistentTaskExecutor(
                 client,
                 DownsampleShardTask.TASK_NAME,
-                threadPool.executor(DOWNSAMPLE_TASK_THREAD_POOL_NAME)
+                threadPool.executor(DOWNSAMPLE_TASK_THREAD_POOL_NAME),
+                clusterService
             )
         );
     }
