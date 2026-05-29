@@ -262,6 +262,15 @@ abstract sealed class NumericMetricFieldDownsampler extends AbstractFieldDownsam
         }
 
         @Override
+        public boolean exhausted(SortedNumericDoubleValues docValues) {
+            var iterator = docValues.docIdIterator();
+            if (iterator == null) {
+                return false;
+            }
+            return iterator.docID() == DocIdSetIterator.NO_MORE_DOCS;
+        }
+
+        @Override
         public void reset() {
             state = State.EMPTY;
             max = MAX_NO_VALUE;

@@ -190,6 +190,13 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
         BUCKET_COMPLETED;
     }
 
+    /**
+     * @return true if the field has been exhausted (reached max doc) and no more values can be collected.
+     */
+    public boolean exhausted(T docValues) {
+        return false;
+    }
+
     static class DownsamplerCountPerValueType {
         private int numericFields = 0;
         private int aggregateCounterFields = 0;

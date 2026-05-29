@@ -69,6 +69,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -90,8 +91,8 @@ class DownsampleShardIndexer {
 
     private static final Logger logger = LogManager.getLogger(DownsampleShardIndexer.class);
     private static final int DOCID_BUFFER_SIZE = 8096;
-    public static final int DOWNSAMPLE_BULK_ACTIONS = 10000;
-    public static final ByteSizeValue DOWNSAMPLE_BULK_SIZE = ByteSizeValue.of(1, ByteSizeUnit.MB);
+    public static final int DOWNSAMPLE_BULK_ACTIONS = 50000;
+    public static final ByteSizeValue DOWNSAMPLE_BULK_SIZE = ByteSizeValue.of(16, ByteSizeUnit.MB);
     public static final ByteSizeValue DOWNSAMPLE_MAX_BYTES_IN_FLIGHT = ByteSizeValue.of(50, ByteSizeUnit.MB);
     private final IndexShard indexShard;
     private final Client client;
@@ -583,6 +584,8 @@ class DownsampleShardIndexer {
 
             final IntArrayList docIdBuffer = new IntArrayList(DOCID_BUFFER_SIZE);
             final long timestampBoundStartTime = searchExecutionContext.getIndexSettings().getTimestampBounds().startTime();
+            private long lastCollectedSourceTimestamp;
+            private long lastCollectedTargetTimestamp;
 
             LeafDownsampleCollector(
                 AggregationExecutionContext aggCtx,
@@ -614,7 +617,6 @@ class DownsampleShardIndexer {
                     bulkCollection();
                     currentLeafCollector = this;
                 }
-                task.addNumReceived(1);
                 final BytesRef tsidHash = aggCtx.getTsidHash();
                 assert tsidHash != null : "Document without [" + TimeSeriesIdFieldMapper.NAME + "] field was found.";
                 final int tsidHashOrd = aggCtx.getTsidHashOrd();
@@ -624,8 +626,6 @@ class DownsampleShardIndexer {
                 if (tsidChanged || timestamp < lastHistoTimestamp) {
                     lastHistoTimestamp = Math.max(rounding.round(timestamp), timestampBoundStartTime);
                 }
-                task.setLastSourceTimestamp(timestamp);
-                task.setLastTargetTimestamp(lastHistoTimestamp);
 
                 if (logger.isTraceEnabled()) {
                     logger.trace(
@@ -653,6 +653,9 @@ class DownsampleShardIndexer {
                     bucketsCreated++;
                 }
 
+                lastCollectedSourceTimestamp = timestamp;
+                lastCollectedTargetTimestamp = lastHistoTimestamp;
+
                 // buffer.add() always delegates to system.arraycopy() and checks buffer size for resizing purposes:
                 docIdBuffer.buffer[docIdBuffer.elementsCount++] = docId;
                 if (docIdBuffer.size() == DOCID_BUFFER_SIZE) {
@@ -669,6 +672,9 @@ class DownsampleShardIndexer {
                     logger.debug("buffered {} docids", docIdBuffer.size());
                 }
 
+                task.addNumReceived(docIdBuffer.size());
+                task.setLastSourceTimestamp(lastCollectedSourceTimestamp);
+                task.setLastTargetTimestamp(lastCollectedTargetTimestamp);
                 downsampleBucketBuilder.collectDocCount(docIdBuffer, docCountProvider);
 
                 // Iterate over all field values and collect the doc_values for this docId
@@ -823,6 +829,10 @@ class DownsampleShardIndexer {
         // Track field downsamplers that collected values in the current bucket.
         private final AbstractFieldDownsampler<?>[] usedFieldDownsamplers;
         private int usedFieldDownsamplersCount;
+        private final IdentityHashMap<AbstractFieldDownsampler<?>, Integer> fieldDownsamplerToSerializerOrd;
+        private final int[] usedFieldSerializerOrds;
+        private final boolean[] fieldSerializerUsed;
+        private int usedFieldSerializerCount;
 
         DownsampleBucketBuilder(
             List<AbstractFieldDownsampler<?>> fieldDownsamplers,
@@ -836,19 +846,36 @@ class DownsampleShardIndexer {
             this.aggregateCounterDownsamplers = aggregateCounterDownsamplers;
             this.aggregateHistogramDownsamplers = aggregateHistogramDownsamplers;
             this.usedFieldDownsamplers = new AbstractFieldDownsampler<?>[fieldDownsamplers.size()];
+            this.fieldDownsamplerToSerializerOrd = new IdentityHashMap<>(fieldDownsamplers.size());
             /*
              * The field downsamplers for aggregate_metric_double all share the same name (this is
              * the name they will be serialized in the target index). We group all field downsamplers by
              * name. If grouping yields multiple field downsamplers, we delegate serialization to
              * the AggregateMetricFieldSerializer class.
              */
-            fieldSerializers = fieldDownsamplers.stream().collect(groupingBy(AbstractFieldDownsampler::name)).entrySet().stream().map(e -> {
-                if (e.getValue().size() == 1) {
-                    return e.getValue().get(0);
+            Map<String, List<AbstractFieldDownsampler<?>>> groupedDownsamplers = fieldDownsamplers.stream()
+                .collect(groupingBy(AbstractFieldDownsampler::name));
+            fieldSerializers = new DownsampleFieldSerializer[groupedDownsamplers.size()];
+            int fieldSerializerOrd = 0;
+            for (Map.Entry<String, List<AbstractFieldDownsampler<?>>> entry : groupedDownsamplers.entrySet()) {
+                List<AbstractFieldDownsampler<?>> downsamplers = entry.getValue();
+                if (downsamplers.size() == 1) {
+                    fieldSerializers[fieldSerializerOrd] = downsamplers.get(0);
                 } else {
-                    return new AggregateMetricDoubleFieldDownsampler.Serializer(e.getKey(), e.getValue());
+                    fieldSerializers[fieldSerializerOrd] = new AggregateMetricDoubleFieldDownsampler.Serializer(
+                        entry.getKey(),
+                        downsamplers
+                    );
                 }
-            }).toArray(DownsampleFieldSerializer[]::new);
+                for (AbstractFieldDownsampler<?> downsampler : downsamplers) {
+                    if (downsampler instanceof DimensionFieldDownsampler == false) {
+                        fieldDownsamplerToSerializerOrd.put(downsampler, fieldSerializerOrd);
+                    }
+                }
+                fieldSerializerOrd++;
+            }
+            this.usedFieldSerializerOrds = new int[fieldSerializers.length];
+            this.fieldSerializerUsed = new boolean[fieldSerializers.length];
         }
 
         /**
@@ -884,6 +911,10 @@ class DownsampleShardIndexer {
                 usedFieldDownsamplers[i] = null;
             }
             usedFieldDownsamplersCount = 0;
+            for (int i = 0; i < usedFieldSerializerCount; i++) {
+                fieldSerializerUsed[usedFieldSerializerOrds[i]] = false;
+            }
+            usedFieldSerializerCount = 0;
 
             boolean needResetTracking = aggregateCounterDownsamplers.length > 0 || aggregateHistogramDownsamplers.length > 0;
             this.resetDataPoints = needResetTracking ? new ResetDataPoints() : null;
@@ -933,9 +964,12 @@ class DownsampleShardIndexer {
             assert downsampledDocumentDocCount > 0 : "Reset documents should already be included in the processed document count";
             builder.field(DocCountFieldMapper.NAME, downsampledDocumentDocCount);
 
-            // Serialize fields
-            for (DownsampleFieldSerializer fieldDownsampler : fieldSerializers) {
-                fieldDownsampler.write(builder);
+            // Serialize fields that collected values in this bucket.
+            for (int i = 0; i < usedFieldSerializerCount; i++) {
+                fieldSerializers[usedFieldSerializerOrds[i]].write(builder);
+            }
+            for (DimensionFieldDownsampler dimensionFieldDownsampler : dimensionDownsamplers) {
+                dimensionFieldDownsampler.write(builder);
             }
 
             extractLegacyDimensionsIfNeeded(builder);
@@ -1015,6 +1049,11 @@ class DownsampleShardIndexer {
         public void markFieldDownsamplerAsUsed(AbstractFieldDownsampler<?> fieldDownsampler) {
             assert usedFieldDownsamplersCount < usedFieldDownsamplers.length;
             usedFieldDownsamplers[usedFieldDownsamplersCount++] = fieldDownsampler;
+            Integer fieldSerializerOrd = fieldDownsamplerToSerializerOrd.get(fieldDownsampler);
+            if (fieldSerializerOrd != null && fieldSerializerUsed[fieldSerializerOrd] == false) {
+                fieldSerializerUsed[fieldSerializerOrd] = true;
+                usedFieldSerializerOrds[usedFieldSerializerCount++] = fieldSerializerOrd;
+            }
         }
     }
 }

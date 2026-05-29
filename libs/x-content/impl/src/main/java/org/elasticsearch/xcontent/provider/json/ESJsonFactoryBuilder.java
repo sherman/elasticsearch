@@ -13,6 +13,10 @@ import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonFactoryBuilder;
 
 public class ESJsonFactoryBuilder extends JsonFactoryBuilder {
+    public ESJsonFactoryBuilder() {
+        disable(JsonFactory.Feature.INTERN_FIELD_NAMES);
+    }
+
     @Override
     public JsonFactory build() {
         return new ESJsonFactory(this);
