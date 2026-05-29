@@ -263,6 +263,9 @@ abstract sealed class NumericMetricFieldDownsampler extends AbstractFieldDownsam
 
         @Override
         public boolean exhausted(SortedNumericDoubleValues docValues) {
+            if (collectionMode == AggregateGaugeCollectionMode.LEGACY) {
+                return false;
+            }
             var iterator = docValues.docIdIterator();
             if (iterator == null) {
                 return false;

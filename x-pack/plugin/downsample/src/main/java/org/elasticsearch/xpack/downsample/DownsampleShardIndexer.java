@@ -69,7 +69,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -91,6 +90,7 @@ class DownsampleShardIndexer {
 
     private static final Logger logger = LogManager.getLogger(DownsampleShardIndexer.class);
     private static final int DOCID_BUFFER_SIZE = 8096;
+    private static final int EXHAUSTED_CHECK_INTERVAL = 1000;
     public static final int DOWNSAMPLE_BULK_ACTIONS = 50000;
     public static final ByteSizeValue DOWNSAMPLE_BULK_SIZE = ByteSizeValue.of(16, ByteSizeUnit.MB);
     public static final ByteSizeValue DOWNSAMPLE_MAX_BYTES_IN_FLIGHT = ByteSizeValue.of(50, ByteSizeUnit.MB);
@@ -212,6 +212,9 @@ class DownsampleShardIndexer {
                 )
             );
             downsamplers.addAll(DimensionFieldDownsampler.create(searchExecutionContext, dimensions, multiFieldSources, fieldCounts));
+            for (int i = 0; i < downsamplers.size(); i++) {
+                downsamplers.get(i).setDownsamplerOrd(i);
+            }
             this.timestampValueFetcher = new TimestampValueFetcher(timestampField, searchExecutionContext);
             this.fieldDownsamplers = Collections.unmodifiableList(downsamplers);
             toClose = null;
@@ -575,6 +578,9 @@ class DownsampleShardIndexer {
             final DocCountProvider docCountProvider;
             final FormattedDocValues[] dimensionDocValues;
             final SortedNumericDoubleValues[] numericValues;
+            private final NumericMetricFieldDownsampler[] activeNumericDownsamplers;
+            private int activeNumericDownsamplersCount;
+            private int numericCollectsUntilExhaustedCheck = EXHAUSTED_CHECK_INTERVAL;
             final FormattedDocValues[] formattedDocValues;
             final ExponentialHistogramValuesReader[] exponentialHistogramValues;
             final HistogramValues[] tDigestHistogramValues;
@@ -603,6 +609,8 @@ class DownsampleShardIndexer {
                 this.docCountProvider = docCountProvider;
                 this.dimensionDocValues = dimensionDocValues;
                 this.numericValues = numericValues;
+                this.activeNumericDownsamplers = numericDownsamplers.clone();
+                this.activeNumericDownsamplersCount = activeNumericDownsamplers.length;
                 this.formattedDocValues = formattedDocValues;
                 this.exponentialHistogramValues = exponentialHistogramValues;
                 this.tDigestHistogramValues = tDigestHistogramValues;
@@ -678,7 +686,7 @@ class DownsampleShardIndexer {
                 downsampleBucketBuilder.collectDocCount(docIdBuffer, docCountProvider);
 
                 // Iterate over all field values and collect the doc_values for this docId
-                collect(numericDownsamplers, numericValues);
+                activeNumericDownsamplersCount = collect(activeNumericDownsamplers, numericValues, activeNumericDownsamplersCount, true);
                 collect(formattedDocValuesDownsamplers, formattedDocValues);
                 collect(exponentialHistogramDownsamplers, exponentialHistogramValues);
                 collect(tDigestHistogramDownsamplers, tDigestHistogramValues);
@@ -727,16 +735,41 @@ class DownsampleShardIndexer {
             }
 
             private <T> void collect(AbstractFieldDownsampler<T>[] downsamplers, T[] docValues) throws IOException {
+                collect(downsamplers, docValues, downsamplers.length, false);
+            }
+
+            private <T> int collect(
+                AbstractFieldDownsampler<T>[] downsamplers,
+                T[] docValues,
+                int activeDownsamplersCount,
+                boolean removeExhausted
+            ) throws IOException {
                 assert downsamplers.length == docValues.length
                     : "Number of downsamplers [" + downsamplers.length + "] does not match number of doc values [" + docValues.length + "]";
-                for (int i = 0; i < downsamplers.length; i++) {
+                assert activeDownsamplersCount <= downsamplers.length;
+                for (int i = 0; i < activeDownsamplersCount;) {
                     var fieldDownsampler = downsamplers[i];
+                    T fieldDocValues = docValues[i];
                     boolean wasEmpty = fieldDownsampler.isEmpty();
-                    fieldDownsampler.collect(docValues[i], docIdBuffer);
+                    fieldDownsampler.collect(fieldDocValues, docIdBuffer);
                     if (wasEmpty && fieldDownsampler.isEmpty() == false) {
                         downsampleBucketBuilder.markFieldDownsamplerAsUsed(fieldDownsampler);
                     }
+                    boolean checkExhausted = removeExhausted && --numericCollectsUntilExhaustedCheck == 0;
+                    if (checkExhausted) {
+                        numericCollectsUntilExhaustedCheck = EXHAUSTED_CHECK_INTERVAL;
+                    }
+                    if (checkExhausted && fieldDownsampler.exhausted(fieldDocValues)) {
+                        activeDownsamplersCount--;
+                        downsamplers[i] = downsamplers[activeDownsamplersCount];
+                        docValues[i] = docValues[activeDownsamplersCount];
+                        downsamplers[activeDownsamplersCount] = fieldDownsampler;
+                        docValues[activeDownsamplersCount] = fieldDocValues;
+                    } else {
+                        i++;
+                    }
                 }
+                return activeDownsamplersCount;
             }
 
             /**
@@ -827,9 +860,9 @@ class DownsampleShardIndexer {
         private final boolean legacyDimensions;
 
         // Track field downsamplers that collected values in the current bucket.
-        private final AbstractFieldDownsampler<?>[] usedFieldDownsamplers;
+        private final AbstractFieldDownsampler<?>[] fieldDownsamplers;
+        private final int[] usedFieldDownsamplerOrds;
         private int usedFieldDownsamplersCount;
-        private final IdentityHashMap<AbstractFieldDownsampler<?>, Integer> fieldDownsamplerToSerializerOrd;
         private final int[] usedFieldSerializerOrds;
         private final boolean[] fieldSerializerUsed;
         private int usedFieldSerializerCount;
@@ -845,8 +878,8 @@ class DownsampleShardIndexer {
             this.dimensionDownsamplers = dimensionDownsamplers;
             this.aggregateCounterDownsamplers = aggregateCounterDownsamplers;
             this.aggregateHistogramDownsamplers = aggregateHistogramDownsamplers;
-            this.usedFieldDownsamplers = new AbstractFieldDownsampler<?>[fieldDownsamplers.size()];
-            this.fieldDownsamplerToSerializerOrd = new IdentityHashMap<>(fieldDownsamplers.size());
+            this.fieldDownsamplers = fieldDownsamplers.toArray(new AbstractFieldDownsampler<?>[0]);
+            this.usedFieldDownsamplerOrds = new int[fieldDownsamplers.size()];
             /*
              * The field downsamplers for aggregate_metric_double all share the same name (this is
              * the name they will be serialized in the target index). We group all field downsamplers by
@@ -869,7 +902,7 @@ class DownsampleShardIndexer {
                 }
                 for (AbstractFieldDownsampler<?> downsampler : downsamplers) {
                     if (downsampler instanceof DimensionFieldDownsampler == false) {
-                        fieldDownsamplerToSerializerOrd.put(downsampler, fieldSerializerOrd);
+                        downsampler.setSerializerOrd(fieldSerializerOrd);
                     }
                 }
                 fieldSerializerOrd++;
@@ -907,8 +940,7 @@ class DownsampleShardIndexer {
             this.docCount = 0;
 
             for (int i = 0; i < usedFieldDownsamplersCount; i++) {
-                usedFieldDownsamplers[i].reset();
-                usedFieldDownsamplers[i] = null;
+                fieldDownsamplers[usedFieldDownsamplerOrds[i]].reset();
             }
             usedFieldDownsamplersCount = 0;
             for (int i = 0; i < usedFieldSerializerCount; i++) {
@@ -1047,10 +1079,12 @@ class DownsampleShardIndexer {
         }
 
         public void markFieldDownsamplerAsUsed(AbstractFieldDownsampler<?> fieldDownsampler) {
-            assert usedFieldDownsamplersCount < usedFieldDownsamplers.length;
-            usedFieldDownsamplers[usedFieldDownsamplersCount++] = fieldDownsampler;
-            Integer fieldSerializerOrd = fieldDownsamplerToSerializerOrd.get(fieldDownsampler);
-            if (fieldSerializerOrd != null && fieldSerializerUsed[fieldSerializerOrd] == false) {
+            int downsamplerOrd = fieldDownsampler.downsamplerOrd();
+            assert downsamplerOrd >= 0 && downsamplerOrd < fieldDownsamplers.length;
+            assert usedFieldDownsamplersCount < usedFieldDownsamplerOrds.length;
+            usedFieldDownsamplerOrds[usedFieldDownsamplersCount++] = downsamplerOrd;
+            int fieldSerializerOrd = fieldDownsampler.serializerOrd();
+            if (fieldSerializerOrd >= 0 && fieldSerializerUsed[fieldSerializerOrd] == false) {
                 fieldSerializerUsed[fieldSerializerOrd] = true;
                 usedFieldSerializerOrds[usedFieldSerializerCount++] = fieldSerializerOrd;
             }

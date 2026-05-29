@@ -35,6 +35,8 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
     private final String name;
     protected State state;
     protected final IndexFieldData<?> fieldData;
+    private int downsamplerOrd = -1;
+    private int serializerOrd = -1;
 
     AbstractFieldDownsampler(String name, IndexFieldData<?> fieldData) {
         this.name = name;
@@ -66,6 +68,22 @@ abstract class AbstractFieldDownsampler<T> implements DownsampleFieldSerializer 
      */
     public boolean isDone() {
         return state == State.BUCKET_COMPLETED;
+    }
+
+    int downsamplerOrd() {
+        return downsamplerOrd;
+    }
+
+    void setDownsamplerOrd(int downsamplerOrd) {
+        this.downsamplerOrd = downsamplerOrd;
+    }
+
+    int serializerOrd() {
+        return serializerOrd;
+    }
+
+    void setSerializerOrd(int serializerOrd) {
+        this.serializerOrd = serializerOrd;
     }
 
     /**
