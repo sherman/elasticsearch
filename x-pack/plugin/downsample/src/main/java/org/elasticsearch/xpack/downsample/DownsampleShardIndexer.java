@@ -686,7 +686,16 @@ class DownsampleShardIndexer {
                 downsampleBucketBuilder.collectDocCount(docIdBuffer, docCountProvider);
 
                 // Iterate over all field values and collect the doc_values for this docId
-                activeNumericDownsamplersCount = collect(activeNumericDownsamplers, numericValues, activeNumericDownsamplersCount, true);
+                boolean checkExhausted = --numericCollectsUntilExhaustedCheck == 0;
+                if (checkExhausted) {
+                    numericCollectsUntilExhaustedCheck = EXHAUSTED_CHECK_INTERVAL;
+                }
+                activeNumericDownsamplersCount = collect(
+                    activeNumericDownsamplers,
+                    numericValues,
+                    activeNumericDownsamplersCount,
+                    checkExhausted
+                );
                 collect(formattedDocValuesDownsamplers, formattedDocValues);
                 collect(exponentialHistogramDownsamplers, exponentialHistogramValues);
                 collect(tDigestHistogramDownsamplers, tDigestHistogramValues);
@@ -742,7 +751,7 @@ class DownsampleShardIndexer {
                 AbstractFieldDownsampler<T>[] downsamplers,
                 T[] docValues,
                 int activeDownsamplersCount,
-                boolean removeExhausted
+                boolean checkExhausted
             ) throws IOException {
                 assert downsamplers.length == docValues.length
                     : "Number of downsamplers [" + downsamplers.length + "] does not match number of doc values [" + docValues.length + "]";
@@ -754,10 +763,6 @@ class DownsampleShardIndexer {
                     fieldDownsampler.collect(fieldDocValues, docIdBuffer);
                     if (wasEmpty && fieldDownsampler.isEmpty() == false) {
                         downsampleBucketBuilder.markFieldDownsamplerAsUsed(fieldDownsampler);
-                    }
-                    boolean checkExhausted = removeExhausted && --numericCollectsUntilExhaustedCheck == 0;
-                    if (checkExhausted) {
-                        numericCollectsUntilExhaustedCheck = EXHAUSTED_CHECK_INTERVAL;
                     }
                     if (checkExhausted && fieldDownsampler.exhausted(fieldDocValues)) {
                         activeDownsamplersCount--;
@@ -800,7 +805,6 @@ class DownsampleShardIndexer {
                 downsampleBucketBuilder.updateResetDataPoints();
                 XContentBuilder downsampleDocument = downsampleBucketBuilder.buildDownsampleDocument();
                 indexBucket(downsampleDocument);
-
                 downsampleBucketBuilder.flushResetDocumentsIfNeeded(this::indexBucket);
             }
         }
